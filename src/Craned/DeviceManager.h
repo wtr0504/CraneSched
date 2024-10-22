@@ -21,24 +21,25 @@
 
 namespace Craned {
 
-enum BPF_PERMISSION{
-    ALLOW = 0,
-    DENY
-};
+enum BPF_PERMISSION { ALLOW = 0, DENY };
 
+#pragma pack(push, 8)
 struct BpfKey {
   uint64_t cgroup_id;
   uint32_t major;
   uint32_t minor;
 };
+#pragma pack(pop)
 
+#pragma pack(push, 8)
 struct BpfDeviceMeta {
-    unsigned int major;
-    unsigned int minor;
-    int permission;
-    short access;
-    short type;
+  uint32_t major;
+  uint32_t minor;
+  int permission;
+  short access;
+  short type;
 };
+#pragma pack(pop)
 
 struct BasicDevice {
   std::string dev_id;

@@ -305,7 +305,7 @@ std::string CgroupManager::CgroupStrByTaskId_(task_id_t task_id) {
  *   - -1 on error
  * On failure, the state of cgroup is undefined.
  */
-std::unique_ptr<Cgroup> CgroupManager::CreateOrOpen_(
+std::unique_ptr<CgroupInterface> CgroupManager::CreateOrOpen_(
     const std::string &cgroup_string, ControllerFlags preferred_controllers,
     ControllerFlags required_controllers, bool retrieve) {
   using CgroupConstant::Controller;
@@ -449,9 +449,9 @@ bool CgroupManager::CheckIfCgroupForTasksExists(task_id_t task_id) {
   return m_task_id_to_cg_map_.Contains(task_id);
 }
 
-bool CgroupManager::AllocateAndGetCgroup(task_id_t task_id, Cgroup **cg) {
+bool CgroupManager::AllocateAndGetCgroup(task_id_t task_id, CgroupInterface **cg) {
   crane::grpc::ResourceInNode res;
-  Cgroup *pcg;
+  CgroupInterface *pcg;
 
   {
     auto cg_spec_it = m_task_id_to_cg_spec_map_[task_id];
@@ -584,7 +584,7 @@ bool CgroupManager::ReleaseCgroup(uint32_t task_id, uid_t uid) {
     // Kind of async behavior.
 
     // avoid deadlock by Erase at next line
-    Cgroup *cgroup = this->m_task_id_to_cg_map_[task_id]->release();
+    CgroupInterface *cgroup = this->m_task_id_to_cg_map_[task_id]->release();
     this->m_task_id_to_cg_map_.Erase(task_id);
 
     if (cgroup != nullptr) {
@@ -711,7 +711,7 @@ bool CgroupManager::QueryTaskInfoOfUidAsync(uid_t uid, TaskInfoOfUid *info) {
 }
 
 bool CgroupManager::MigrateProcToCgroupOfTask(pid_t pid, task_id_t task_id) {
-  Cgroup *cg;
+  CgroupInterface *cg;
   bool ok = AllocateAndGetCgroup(task_id, &cg);
   if (!ok) return false;
 
@@ -1333,24 +1333,30 @@ bool CgroupV2::SetDeviceAccess(const std::unordered_set<SlotId> &devices,
   cgroup_fd = open(cgroup_path.c_str(), O_RDONLY);
   if (cgroup_fd < 0) {
     CRANE_ERROR("Failed to open cgroup");
-    return 1;
+    return false;
   }
 
   obj = bpf_object__open_file(CgroupConstant::BpfObjectFile, NULL);
   if (!obj) {
     CRANE_ERROR("Failed to open BPF object file {}",
                 CgroupConstant::BpfObjectFile);
+    close(cgroup_fd);
+    bpf_object__close(obj);
     return false;
   }
 
   if (bpf_object__load(obj)) {
     CRANE_ERROR("Failed to load BPF object {}", CgroupConstant::BpfObjectFile);
+    close(cgroup_fd);
+    bpf_object__close(obj);
     return false;
   }
 
-  prog = bpf_object__find_program_by_name(obj, "device_access");
+  prog = bpf_object__find_program_by_name(obj, CgroupConstant::BpfProgramName);
   if (!prog) {
     CRANE_ERROR("Failed to find BPF program {}", CgroupConstant::BpfObjectFile);
+    close(cgroup_fd);
+    bpf_object__close(obj);
     return false;
   }
 
@@ -1358,12 +1364,17 @@ bool CgroupV2::SetDeviceAccess(const std::unordered_set<SlotId> &devices,
   if (prog_fd < 0) {
     CRANE_ERROR("Failed to get BPF program file descriptor {}",
                 CgroupConstant::BpfObjectFile);
+    close(cgroup_fd);
+    bpf_object__close(obj);
     return false;
   }
 
-  dev_map = bpf_object__find_map_by_name(obj, "dev_map");
+  dev_map = bpf_object__find_map_by_name(obj, CgroupConstant::BpfMapName);
   if (!dev_map) {
     CRANE_ERROR("Failed to find BPF map {}", "dev_map");
+    close(cgroup_fd);
+    close(prog_fd);
+    bpf_object__close(obj);
     return false;
   }
 
@@ -1410,17 +1421,26 @@ bool CgroupV2::SetDeviceAccess(const std::unordered_set<SlotId> &devices,
                              sizeof(BpfDeviceMeta), BPF_ANY)) {
       CRANE_ERROR("Failed to update BPF map major {},minor {} cgroup id {}",
                   bpf_devices[i].major, bpf_devices[i].minor, key.cgroup_id);
+      close(cgroup_fd);
+      close(prog_fd);
+
+      bpf_object__close(obj);
       return false;
     }
   }
 
   if (bpf_prog_attach(prog_fd, cgroup_fd, BPF_CGROUP_DEVICE, 0) < 0) {
     CRANE_ERROR("Failed to attach BPF program");
+    close(cgroup_fd);
+    close(prog_fd);
+
+    bpf_object__close(obj);
     return false;
   }
   // attach_bpf_program_to_cgroup(prog_fd, CGROUP_PATH);
 
   close(cgroup_fd);
+  close(prog_fd);
   bpf_object__close(obj);
 
   return true;
@@ -1443,7 +1463,7 @@ bool CgroupV2::RmBpfDeviceMap() {
     return false;
   }
 
-  dev_map = bpf_object__find_map_by_name(obj, "dev_map");
+  dev_map = bpf_object__find_map_by_name(obj, CgroupConstant::BpfMapName);
   if (!dev_map) {
     CRANE_ERROR("Failed to find BPF map {}", "dev_map");
     return false;
@@ -1456,6 +1476,7 @@ bool CgroupV2::RmBpfDeviceMap() {
     if (bpf_map__delete_elem(dev_map, &key, sizeof(BpfKey), BPF_ANY)) {
       CRANE_ERROR("Failed to delete BPF map major {},minor {} in cgroup id {}",
                   bpf_devices[i].major, bpf_devices[i].minor, key.cgroup_id);
+      bpf_object__close(obj);
       return false;
     }
   }
@@ -1533,7 +1554,7 @@ end:
 }
 
 bool AllocatableResourceAllocator::Allocate(const AllocatableResource &resource,
-                                            Cgroup *cg) {
+                                            CgroupInterface *cg) {
   bool ok;
   ok = cg->SetCpuCoreLimit(static_cast<double>(resource.cpu_count));
   ok &= cg->SetMemoryLimitBytes(resource.memory_bytes);
@@ -1546,7 +1567,7 @@ bool AllocatableResourceAllocator::Allocate(const AllocatableResource &resource,
 }
 
 bool AllocatableResourceAllocator::Allocate(
-    const crane::grpc::AllocatableResource &resource, Cgroup *cg) {
+    const crane::grpc::AllocatableResource &resource, CgroupInterface *cg) {
   bool ok;
   ok = cg->SetCpuCoreLimit(resource.cpu_core_limit());
   ok &= cg->SetMemoryLimitBytes(resource.memory_limit_bytes());
@@ -1559,7 +1580,8 @@ bool AllocatableResourceAllocator::Allocate(
 }
 
 bool DedicatedResourceAllocator::Allocate(
-    const crane::grpc::DedicatedResourceInNode &request_resource, Cgroup *cg) {
+    const crane::grpc::DedicatedResourceInNode &request_resource,
+    CgroupInterface *cg) {
   std::unordered_set<std::string> all_request_slots;
   for (const auto &[_, type_slots_map] : request_resource.name_type_map()) {
     for (const auto &[__, slots] : type_slots_map.type_slots_map())
